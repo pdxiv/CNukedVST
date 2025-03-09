@@ -148,7 +148,7 @@ Please see the source files for specific license details.
 
 ## Acknowledgments
 
-* Nuked OPL3 emulator by Nuke. YKT provides the core FM synthesis emulation
+* Nuked OPL3 emulator by nukeykt provides the core FM synthesis emulation
 * The OPL3 Programmer's Guide provided valuable information about register mapping
 * The plugin demonstrates how to create a VST instrument with accurate FM synthesis without relying on external dependencies
 
