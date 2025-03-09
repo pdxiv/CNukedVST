@@ -1,5 +1,5 @@
 /******************************************************************************
- * CNukedVST.cpp (modified to use Nuked-OPL3 for polyphonic FM)          *
+ * CNukedVST.cpp (uses Nuked-OPL3 for polyphonic FM)          *
  ******************************************************************************/
 
 #include "aeffect.h"
@@ -79,23 +79,82 @@ enum {
     kNumGlobalParams // = 8
 };
 
+// VST Parameter enumeration - MONOTIMBRAL design (one set of parameters for all voices)
+enum {
+    // Modulator parameters
+    kVST_Mod_AM = 0,
+    kVST_Mod_VIB,
+    kVST_Mod_EGT,
+    kVST_Mod_KSR,
+    kVST_Mod_MULT,
+    kVST_Mod_KSL,
+    kVST_Mod_TL,
+    kVST_Mod_AR,
+    kVST_Mod_DR,
+    kVST_Mod_SL,
+    kVST_Mod_RR,
+    kVST_Mod_WS,
+    
+    // Carrier parameters
+    kVST_Car_AM,
+    kVST_Car_VIB,
+    kVST_Car_EGT,
+    kVST_Car_KSR,
+    kVST_Car_MULT,
+    kVST_Car_KSL,
+    kVST_Car_TL,
+    kVST_Car_AR,
+    kVST_Car_DR,
+    kVST_Car_SL,
+    kVST_Car_RR,
+    kVST_Car_WS,
+    
+    // Channel parameters
+    kVST_FB,
+    kVST_CON,
+    kVST_LEFT,
+    kVST_RIGHT,
+    
+    // Global parameters - only keep essential ones
+    kVST_TremoloDepth,
+    kVST_VibratoDepth,
+    
+    // No longer exposing these rhythm mode parameters:
+    // kVST_RhythmMode,
+    // kVST_HH,
+    // kVST_TC,
+    // kVST_TOM,
+    // kVST_SD,
+    // kVST_BD,
+    
+    kNumVSTParams
+};
+
 // So total parameters = OPL3_TOTAL_OPERATORS * kNumOperatorParams + OPL3_CHANNEL_COUNT * kNumChannelParams + kNumGlobalParams
 static const int TOTAL_OPERATOR_PARAMETERS = OPL3_TOTAL_OPERATORS * kNumOperatorParams;
 static const int TOTAL_CHANNEL_PARAMETERS = OPL3_CHANNEL_COUNT * kNumChannelParams;
-static const int TOTAL_VST_PARAMETERS = TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS + kNumGlobalParams;
+static const int TOTAL_INTERNAL_PARAMETERS = TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS + kNumGlobalParams;
 
 // Parameter name helpers
 static const char* PARAM_NAMES[kNumOperatorParams] = {
-    "AM", "VIB", "EGT", "KSR", "MULT", "KSL", "TL", "AR", "DR", "SL", "RR", "WS"
+    "Tremolo", "Vibrato", "Sustain", "KSR", "Mult", "KSL", "Level", "Attack", "Decay", "Sustain Lv", "Release", "Waveform"
 };
 
 static const char* CHANNEL_NAMES[kNumChannelParams] = {
-    "FB", "CON", "LEFT", "RIGHT"
+    "Feedback", "Connection", "Left Out", "Right Out"
 };
 
 static const char* GLOBAL_NAMES[kNumGlobalParams] = {
     "Tremolo Depth", "Vibrato Depth", "Rhythm Mode", "HH", "TC", "TOM", "SD", "BD"
 };
+
+// New descriptive names for the operators
+static const char* OPERATOR_TYPES[2] = {
+    "Mod", "Car"  // Modulator and Carrier
+};
+
+// We manage 16 voices in software, mapped onto 16 out of 18 possible OPL3 channels.
+static const int MAX_VOICES = 16;
 
 // -----------------------------------------------------------------------------
 // We define a minimal VoiceInfo structure to handle MIDI notes -> channel assignment
@@ -106,9 +165,6 @@ struct VoiceInfo {
     float frequency;
     int channelIndex; // which OPL3 channel is being used
 };
-
-// We manage 16 voices in software, mapped onto 16 out of 18 possible OPL3 channels.
-static const int MAX_VOICES = 16;
 
 // -----------------------------------------------------------------------------
 // Our main plugin "class." In real VST2 code, you'd typically wrap this in a class
@@ -121,7 +177,10 @@ typedef struct MyOPL3VST {
     opl3_chip       chip;                     // Nuked-OPL3 instance (correct type from opl3.h)
 
     // We store all parameter values in a float array. Each is [0..1], we scale them later.
-    float           paramValues[TOTAL_VST_PARAMETERS];
+    float           paramValues[TOTAL_INTERNAL_PARAMETERS];
+    
+    // For the monotimbral interface, we need to store the current settings that apply to all voices
+    float           currentSettings[2*kNumOperatorParams + kNumChannelParams + kNumGlobalParams];
 
 } MyOPL3VST;
 
@@ -141,6 +200,9 @@ static void handleMidiEvent(MyOPL3VST* vst, VstMidiEvent& midiEvent);
 // We'll make a small helper so we can write OPL3 registers for each parameter
 static void updateOPL3Parameters(MyOPL3VST* vst);
 
+// Helper to apply current voice settings to all OPL3 channels
+static void applyVoiceSettingsToAllChannels(MyOPL3VST* vst);
+
 // -----------------------------------------------------------------------------
 // 2) Entry point to create the plugin object
 // -----------------------------------------------------------------------------
@@ -159,7 +221,7 @@ extern "C" AEffect* VSTPluginMain(audioMasterCallback audioMaster)
     ae.getParameter     = getParameter;
     ae.processReplacing = processReplacing;
     ae.numPrograms      = kNumPrograms;
-    ae.numParams        = TOTAL_VST_PARAMETERS;
+    ae.numParams        = kNumVSTParams;  // Monotimbral interface has fewer parameters
     ae.numInputs        = kNumInputs;
     ae.numOutputs       = kNumOutputs;
     
@@ -183,48 +245,52 @@ extern "C" AEffect* VSTPluginMain(audioMasterCallback audioMaster)
     }
 
     // Initialize paramValues with sensible defaults
-    for (int i = 0; i < TOTAL_VST_PARAMETERS; i++) {
+    for (int i = 0; i < TOTAL_INTERNAL_PARAMETERS; i++) {
         // Default initialization to prevent undefined behavior
         vst->paramValues[i] = 0.f;
     }
     
-    // Set some reasonable defaults for operators
-    for (int op = 0; op < OPL3_TOTAL_OPERATORS; op++) {
-        // Some typical values for a basic FM sound
-        int baseIndex = op * kNumOperatorParams;
-        vst->paramValues[baseIndex + kParamAM]   = 0.0f; // AM off
-        vst->paramValues[baseIndex + kParamVIB]  = 0.0f; // VIB off
-        vst->paramValues[baseIndex + kParamEGT]  = 0.0f; // EGT non-sustaining
-        vst->paramValues[baseIndex + kParamKSR]  = 0.0f; // KSR off
-        vst->paramValues[baseIndex + kParamMULT] = 0.2f; // MULT around 2-3
-        vst->paramValues[baseIndex + kParamKSL]  = 0.0f; // KSL 0
-        vst->paramValues[baseIndex + kParamTL]   = (op % 2 == 0) ? 0.2f : 0.0f; // Carrier louder than modulator
-        vst->paramValues[baseIndex + kParamAR]   = 0.8f; // Fast attack
-        vst->paramValues[baseIndex + kParamDR]   = 0.4f; // Medium decay
-        vst->paramValues[baseIndex + kParamSL]   = 0.3f; // Medium sustain level
-        vst->paramValues[baseIndex + kParamRR]   = 0.5f; // Medium release
-        vst->paramValues[baseIndex + kParamWS]   = 0.0f; // Sine wave
-    }
+    // Initialize VST interface parameters with sensible defaults
+    // Modulator (operator 0)
+    vst->currentSettings[kVST_Mod_AM]   = 0.0f; // AM off
+    vst->currentSettings[kVST_Mod_VIB]  = 0.0f; // VIB off
+    vst->currentSettings[kVST_Mod_EGT]  = 0.0f; // EGT non-sustaining
+    vst->currentSettings[kVST_Mod_KSR]  = 0.0f; // KSR off
+    vst->currentSettings[kVST_Mod_MULT] = 0.2f; // MULT around 2-3
+    vst->currentSettings[kVST_Mod_KSL]  = 0.0f; // KSL 0
+    vst->currentSettings[kVST_Mod_TL]   = 0.1f; // Modulator level
+    vst->currentSettings[kVST_Mod_AR]   = 1.0f; // Fastest attack
+    vst->currentSettings[kVST_Mod_DR]   = 0.4f; // Medium decay
+    vst->currentSettings[kVST_Mod_SL]   = 0.3f; // Medium sustain level
+    vst->currentSettings[kVST_Mod_RR]   = 0.5f; // Medium release
+    vst->currentSettings[kVST_Mod_WS]   = 0.0f; // Sine wave
     
-    // Set defaults for channels
-    for (int ch = 0; ch < OPL3_CHANNEL_COUNT; ch++) {
-        int baseIndex = TOTAL_OPERATOR_PARAMETERS + ch * kNumChannelParams;
-        vst->paramValues[baseIndex + kParamFeedback]    = 0.0f; // No feedback
-        vst->paramValues[baseIndex + kParamConnection]  = 0.0f; // FM mode
-        vst->paramValues[baseIndex + kParamLeftOutput]  = 1.0f; // Left output on
-        vst->paramValues[baseIndex + kParamRightOutput] = 1.0f; // Right output on
-    }
+    // Carrier (operator 1)
+    vst->currentSettings[kVST_Car_AM]   = 0.0f; // AM off
+    vst->currentSettings[kVST_Car_VIB]  = 0.0f; // VIB off
+    vst->currentSettings[kVST_Car_EGT]  = 0.0f; // EGT non-sustaining
+    vst->currentSettings[kVST_Car_KSR]  = 0.0f; // KSR off
+    vst->currentSettings[kVST_Car_MULT] = 0.2f; // MULT around 2-3
+    vst->currentSettings[kVST_Car_KSL]  = 0.0f; // KSL 0
+    vst->currentSettings[kVST_Car_TL]   = 0.0f; // Maximum volume for carrier
+    vst->currentSettings[kVST_Car_AR]   = 1.0f; // Fastest attack
+    vst->currentSettings[kVST_Car_DR]   = 0.4f; // Medium decay
+    vst->currentSettings[kVST_Car_SL]   = 0.3f; // Medium sustain level
+    vst->currentSettings[kVST_Car_RR]   = 0.5f; // Medium release
+    vst->currentSettings[kVST_Car_WS]   = 0.0f; // Sine wave
     
-    // Set global parameter defaults
-    int globalBaseIndex = TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS;
-    vst->paramValues[globalBaseIndex + kParamTremoloDepth] = 0.0f; // Normal tremolo
-    vst->paramValues[globalBaseIndex + kParamVibratoDepth] = 0.0f; // Normal vibrato
-    vst->paramValues[globalBaseIndex + kParamRhythmMode]   = 0.0f; // Rhythm mode off
-    vst->paramValues[globalBaseIndex + kParamHH]           = 0.0f; // All rhythm sounds off
-    vst->paramValues[globalBaseIndex + kParamTC]           = 0.0f;
-    vst->paramValues[globalBaseIndex + kParamTOM]          = 0.0f;
-    vst->paramValues[globalBaseIndex + kParamSD]           = 0.0f;
-    vst->paramValues[globalBaseIndex + kParamBD]           = 0.0f;
+    // Channel parameters
+    vst->currentSettings[kVST_FB]     = 0.0f; // No feedback
+    vst->currentSettings[kVST_CON]    = 0.0f; // FM mode
+    vst->currentSettings[kVST_LEFT]   = 1.0f; // Left output on
+    vst->currentSettings[kVST_RIGHT]  = 1.0f; // Right output on
+    
+    // Global parameters
+    vst->currentSettings[kVST_TremoloDepth] = 0.0f; // Normal tremolo
+    vst->currentSettings[kVST_VibratoDepth] = 0.0f; // Normal vibrato
+    
+    // Apply these settings to the internal OPL3 parameters for all voices
+    applyVoiceSettingsToAllChannels(vst);
 
     // Initialize OPL3 at 44.1k
     OPL3_Reset(&vst->chip, vst->sampleRate);
@@ -232,10 +298,48 @@ extern "C" AEffect* VSTPluginMain(audioMasterCallback audioMaster)
     // Enable OPL3 features (not OPL2 mode)
     OPL3_WriteReg(&vst->chip, 0x105, 1);
     
+    // Set waveform select enable bit
+    OPL3_WriteReg(&vst->chip, 0x01, 0x20);
+    
     // Initialize all parameters to the default values
     updateOPL3Parameters(vst);
 
     return &ae;
+}
+
+// -----------------------------------------------------------------------------
+// Helper to apply the current voice settings to all channels
+// -----------------------------------------------------------------------------
+static void applyVoiceSettingsToAllChannels(MyOPL3VST* vst)
+{
+    // Apply modulator settings to all modulator operators (operator 0 in each channel)
+    for (int ch = 0; ch < MAX_VOICES; ch++) {
+        int op = ch * 2; // Modulator operator index
+        
+        // Copy all modulator parameters
+        for (int param = 0; param < kNumOperatorParams; param++) {
+            vst->paramValues[op*kNumOperatorParams + param] = vst->currentSettings[param];
+        }
+        
+        // Copy all carrier parameters
+        op = ch * 2 + 1; // Carrier operator index
+        for (int param = 0; param < kNumOperatorParams; param++) {
+            vst->paramValues[op*kNumOperatorParams + param] = vst->currentSettings[kNumOperatorParams + param];
+        }
+        
+        // Copy channel parameters
+        int chParamIndex = TOTAL_OPERATOR_PARAMETERS + ch * kNumChannelParams;
+        for (int param = 0; param < kNumChannelParams; param++) {
+            vst->paramValues[chParamIndex + param] = vst->currentSettings[2*kNumOperatorParams + param];
+        }
+    }
+    
+    // Copy global parameters
+    int globalBaseIndex = TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS;
+    for (int param = 0; param < 2; param++) {  // Only copy the first 2 global parameters we expose
+        vst->paramValues[globalBaseIndex + param] = 
+            vst->currentSettings[2*kNumOperatorParams + kNumChannelParams + param];
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -270,7 +374,7 @@ static intptr_t dispatcher(AEffect* effect, int32_t opCode, int32_t index, intpt
             return 0;
             
         case effGetParamName:
-            if (index >= 0 && index < TOTAL_VST_PARAMETERS)
+            if (index >= 0 && index < kNumVSTParams)
             {
                 getParameterName(vst, index, strPtr);
                 return 1;
@@ -278,7 +382,7 @@ static intptr_t dispatcher(AEffect* effect, int32_t opCode, int32_t index, intpt
             return 0;
             
         case effGetParamDisplay:
-            if (index >= 0 && index < TOTAL_VST_PARAMETERS)
+            if (index >= 0 && index < kNumVSTParams)
             {
                 getParameterDisplay(vst, index, strPtr);
                 return 1;
@@ -344,43 +448,34 @@ static intptr_t dispatcher(AEffect* effect, int32_t opCode, int32_t index, intpt
 // -----------------------------------------------------------------------------
 static void getParameterName(MyOPL3VST* vst, int32_t index, char* label)
 {
-    if (index < TOTAL_OPERATOR_PARAMETERS) {
-        // Operator parameter
-        int opNum = index / kNumOperatorParams;
-        int paramType = index % kNumOperatorParams;
-        
-        int channelNum = opNum / 2;
-        int operatorNum = opNum % 2;
-        
-        sprintf(label, "Ch%d Op%d %s", 
-                channelNum + 1, 
-                operatorNum + 1, 
-                PARAM_NAMES[paramType]);
+    // Modulator parameters
+    if (index < kNumOperatorParams) {
+        sprintf(label, "%s %s", OPERATOR_TYPES[0], PARAM_NAMES[index]);
     }
-    else if (index < TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS) {
-        // Channel parameter
-        int idx = index - TOTAL_OPERATOR_PARAMETERS;
-        int channelNum = idx / kNumChannelParams;
-        int paramType = idx % kNumChannelParams;
-        
-        sprintf(label, "Ch%d %s", 
-                channelNum + 1, 
-                CHANNEL_NAMES[paramType]);
+    // Carrier parameters
+    else if (index < 2*kNumOperatorParams) {
+        int paramIndex = index - kNumOperatorParams;
+        sprintf(label, "%s %s", OPERATOR_TYPES[1], PARAM_NAMES[paramIndex]);
     }
+    // Channel parameters
+    else if (index < 2*kNumOperatorParams + kNumChannelParams) {
+        int paramIndex = index - 2*kNumOperatorParams;
+        strcpy(label, CHANNEL_NAMES[paramIndex]);
+    }
+    // Global parameters
     else {
-        // Global parameter
-        int paramType = index - (TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS);
-        strcpy(label, GLOBAL_NAMES[paramType]);
+        int paramIndex = index - (2*kNumOperatorParams + kNumChannelParams);
+        strcpy(label, GLOBAL_NAMES[paramIndex]);
     }
 }
 
 static void getParameterDisplay(MyOPL3VST* vst, int32_t index, char* text)
 {
-    float value = vst->paramValues[index];
+    float value = vst->currentSettings[index];
     
-    if (index < TOTAL_OPERATOR_PARAMETERS) {
-        // Operator parameter
-        int paramType = index % kNumOperatorParams;
+    // Modulator parameters
+    if (index < kNumOperatorParams) {
+        int paramType = index;
         
         switch (paramType) {
             case kParamAM:
@@ -420,10 +515,51 @@ static void getParameterDisplay(MyOPL3VST* vst, int32_t index, char* text)
                 sprintf(text, "%.2f", value);
         }
     }
-    else if (index < TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS) {
-        // Channel parameter
-        int idx = index - TOTAL_OPERATOR_PARAMETERS;
-        int paramType = idx % kNumChannelParams;
+    // Carrier parameters
+    else if (index < 2*kNumOperatorParams) {
+        int paramType = index - kNumOperatorParams;
+        
+        switch (paramType) {
+            case kParamAM:
+            case kParamVIB:
+            case kParamEGT:
+            case kParamKSR:
+                sprintf(text, "%s", value > 0.5f ? "On" : "Off");
+                break;
+                
+            case kParamMULT:
+                sprintf(text, "%d", static_cast<int>(value * 15.0f));
+                break;
+                
+            case kParamKSL:
+                sprintf(text, "%d dB/oct", static_cast<int>(value * 3.0f));
+                break;
+                
+            case kParamTL:
+                sprintf(text, "%.1f dB", value * 63.0f);
+                break;
+                
+            case kParamAR:
+            case kParamDR:
+            case kParamRR:
+                sprintf(text, "%d", static_cast<int>(value * 15.0f));
+                break;
+                
+            case kParamSL:
+                sprintf(text, "%d", static_cast<int>(value * 15.0f));
+                break;
+                
+            case kParamWS:
+                sprintf(text, "%d", static_cast<int>(value * 7.0f));
+                break;
+                
+            default:
+                sprintf(text, "%.2f", value);
+        }
+    }
+    // Channel parameters
+    else if (index < 2*kNumOperatorParams + kNumChannelParams) {
+        int paramType = index - 2*kNumOperatorParams;
         
         switch (paramType) {
             case kParamFeedback:
@@ -443,19 +579,13 @@ static void getParameterDisplay(MyOPL3VST* vst, int32_t index, char* text)
                 sprintf(text, "%.2f", value);
         }
     }
+    // Global parameters
     else {
-        // Global parameter
-        int paramType = index - (TOTAL_OPERATOR_PARAMETERS + TOTAL_CHANNEL_PARAMETERS);
+        int paramType = index - (2*kNumOperatorParams + kNumChannelParams);
         
         switch (paramType) {
             case kParamTremoloDepth:
             case kParamVibratoDepth:
-            case kParamRhythmMode:
-            case kParamHH:
-            case kParamTC:
-            case kParamTOM:
-            case kParamSD:
-            case kParamBD:
                 sprintf(text, "%s", value > 0.5f ? "On" : "Off");
                 break;
                 
@@ -471,10 +601,13 @@ static void getParameterDisplay(MyOPL3VST* vst, int32_t index, char* text)
 static void setParameter(AEffect* effect, int32_t index, float value)
 {
     MyOPL3VST* vst = (MyOPL3VST*)effect->object;
-    if (index < 0 || index >= TOTAL_VST_PARAMETERS) return;
+    if (index < 0 || index >= kNumVSTParams) return;
 
-    // Store raw float [0..1]
-    vst->paramValues[index] = value;
+    // Store in currentSettings array
+    vst->currentSettings[index] = value;
+    
+    // Apply the setting to all voices
+    applyVoiceSettingsToAllChannels(vst);
 
     // Immediately update the OPL3 register(s)
     updateOPL3Parameters(vst);
@@ -483,9 +616,9 @@ static void setParameter(AEffect* effect, int32_t index, float value)
 static float getParameter(AEffect* effect, int32_t index)
 {
     MyOPL3VST* vst = (MyOPL3VST*)effect->object;
-    if (index < 0 || index >= TOTAL_VST_PARAMETERS) return 0.f;
+    if (index < 0 || index >= kNumVSTParams) return 0.f;
 
-    return vst->paramValues[index];
+    return vst->currentSettings[index];
 }
 
 // -----------------------------------------------------------------------------
@@ -503,22 +636,34 @@ static void updateOPL3Parameters(MyOPL3VST* vst)
 
     // Helper function to compute the OPL register offsets for operator i
     auto getOpBase = [&](int opIndex) -> std::pair<int, int> {
-        // The OPL3 operator indexing is typically:  
-        //   - Bank 0 for channels 0..8, Bank 1 for channels 9..17
-        //   - Operators for each channel: channel + 0x00, channel + 0x03, etc.
-        // This is a big topic in AdLib/OPL docs. 
-        // For demonstration, let's do a simple approach:
-        //   operatorSlot = (channel % 9) + (isCarrier? 3 : 0)
-        //   bank = (channel < 9) ? 0 : 1
-        // Then the actual register = 0x20 + operatorSlot, 0x40+operatorSlot, etc.
-        // This might not be 100% correct for 4-op channels, but it's enough to show the idea.
-
-        int channel = opIndex / 2;           // each channel has 2 ops
-        int isCarrier = (opIndex % 2);       // 0=modulator, 1=carrier
-        int bank = (channel < 9) ? 0 : 1; 
-        int chInBank = channel % 9;
-        int opSlot = chInBank + (isCarrier ? 3 : 0);
-        return std::make_pair(bank, opSlot);
+        // Convert our opIndex (0, 1, 2, ..., 35) to channel and isCarrier
+        int channel = opIndex / 2;
+        int isCarrier = opIndex % 2;
+        
+        // These arrays map from (channel, isCarrier) to actual OPL3 operator index
+        // Per the OPL3 programmer's guide mapping table
+        static const int actualOpIndex[18][2] = {
+            {0, 3},   {1, 4},   {2, 5},   {6, 9},   {7, 10},  {8, 11},
+            {12, 15}, {13, 16}, {14, 17}, {18, 21}, {19, 22}, {20, 23},
+            {24, 27}, {25, 28}, {26, 29}, {30, 33}, {31, 34}, {32, 35}
+        };
+        
+        // Get the actual OPL3 operator index
+        int actualOp = actualOpIndex[channel][isCarrier];
+        
+        // Map actual operator to register offset
+        // Offsets from the OPL3 programming guide
+        static const int regOffsets[36] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15
+        };
+        
+        // Calculate bank and offset
+        int bank = (actualOp >= 18) ? 1 : 0;
+        int offset = regOffsets[actualOp];
+        
+        return std::make_pair(bank, offset);
     };
 
     // First, handle global parameters
@@ -530,16 +675,10 @@ static void updateOPL3Parameters(MyOPL3VST* vst)
     if (vst->paramValues[globalBaseIndex + kParamVibratoDepth] > 0.5f) {
         tremVib |= 0x40; // Deep vibrato
     }
-    // Write to BD register (0xBD)
-    uint8_t rhythmBits = 0;
-    if (vst->paramValues[globalBaseIndex + kParamRhythmMode] > 0.5f) {
-        rhythmBits |= 0x20; // Rhythm mode on
-        if (vst->paramValues[globalBaseIndex + kParamBD] > 0.5f) rhythmBits |= 0x10;
-        if (vst->paramValues[globalBaseIndex + kParamSD] > 0.5f) rhythmBits |= 0x08;
-        if (vst->paramValues[globalBaseIndex + kParamTOM] > 0.5f) rhythmBits |= 0x04;
-        if (vst->paramValues[globalBaseIndex + kParamTC] > 0.5f) rhythmBits |= 0x02;
-        if (vst->paramValues[globalBaseIndex + kParamHH] > 0.5f) rhythmBits |= 0x01;
-    }
+    
+    // Always disable rhythm mode
+    uint8_t rhythmBits = 0; // Always keep rhythm mode disabled
+    
     // Create composite register value (bank 0, register 0xBD)
     uint16_t bdReg = 0x0BD; // Bank 0, register 0xBD
     OPL3_WriteReg(&vst->chip, bdReg, rhythmBits | tremVib);
