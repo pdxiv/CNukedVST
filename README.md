@@ -26,12 +26,23 @@ sudo apt-get update
 sudo apt-get install build-essential
 ```
 
-### Required Libraries
+### Required External Files
 
-You need to download the Nuked OPL3 library files separately:
+Before building, you need the Nuked OPL3 library files:
 
-1. Download `opl3.c` and `opl3.h` from: https://github.com/nukeykt/Nuked-OPL3
-2. Place these files in your project directory alongside `CNukedVST.cpp`
+1. Download these two files from the [Nuked-OPL3 repository](https://github.com/nukeykt/Nuked-OPL3):
+   - `opl3.c`
+
+   - `opl3.h`
+
+2. Place both files in your CNukedVST project directory alongside `CNukedVST.cpp`
+
+You can download them directly using:
+
+```bash
+wget https://raw.githubusercontent.com/nukeykt/Nuked-OPL3/master/opl3.c
+wget https://raw.githubusercontent.com/nukeykt/Nuked-OPL3/master/opl3.h
+```
 
 ### Compilation
 
@@ -40,13 +51,6 @@ You need to download the Nuked OPL3 library files separately:
 ```bash
 git clone https://github.com/yourusername/CNukedVST.git
 cd CNukedVST
-```
-
-2. Download the required Nuked OPL3 files:
-
-```bash
-wget https://raw.githubusercontent.com/nukeykt/Nuked-OPL3/master/opl3.c
-wget https://raw.githubusercontent.com/nukeykt/Nuked-OPL3/master/opl3.h
 ```
 
 2. Build the plugin:
